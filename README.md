@@ -7,14 +7,14 @@ what we grade.
 
 The plumbing is already wired so you can spend your time on design and the feature, not setup:
 
-- **Backend** — .NET 10 minimal API, in-memory store, OpenAPI on. Amenities endpoint works.
+- **Backend** — .NET 9 minimal API, in-memory store, OpenAPI on. Amenities endpoint works.
 - **Frontend** — React + TypeScript + Vite, calling the API through an **orval-generated typed
   client**. One screen lists amenities.
 - **Reservations is your task** — backend endpoints and the UI for it are stubbed with `TODO(candidate)`.
 
 ## Prerequisites
 
-- [.NET SDK 10.0+](https://dotnet.microsoft.com/download)
+- [.NET SDK 9.0+](https://dotnet.microsoft.com/download)
 - [Node.js 20+](https://nodejs.org) and a package manager (`pnpm` recommended; `npm` works too)
 
 ## Run it (two terminals)
