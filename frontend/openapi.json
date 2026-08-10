@@ -1,0 +1,48 @@
+{
+  "openapi": "3.0.1",
+  "info": { "title": "Amenity Reservations API", "version": "v1" },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["System"],
+        "operationId": "getHealth",
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/api/amenities": {
+      "get": {
+        "tags": ["Amenities"],
+        "operationId": "getAmenities",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/Amenity" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Amenity": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string" },
+          "description": { "type": "string", "nullable": true },
+          "capacity": { "type": "integer", "format": "int32" },
+          "maxBookingMinutes": { "type": "integer", "format": "int32" }
+        },
+        "required": ["id", "name", "capacity", "maxBookingMinutes"]
+      }
+    }
+  }
+}

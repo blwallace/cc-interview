@@ -1,0 +1,17 @@
+# Backend
+**/bin/
+**/obj/
+
+# Frontend
+**/node_modules/
+**/dist/
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Interviewer-only handout — do not ship to candidates
+BRIEFING.pdf
