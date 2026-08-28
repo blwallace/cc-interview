@@ -68,8 +68,8 @@ reservation per `(AmenityId, UserId)`.
 **Why `TenantId` is denormalized onto `Reservation`.** It's derivable via `AmenityId`, so storing it
 twice invites drift. Worth it because **authorization shouldn't need a join**: `DELETE
 /api/reservations/{id}` must prove the caller's tenant owns the row, and a join you can forget is a
-security surface where a column you can't forget isn't. RLS and tenant-leading indexes (§4) also
-require it on the table. Drift is prevented by never accepting `TenantId` from the client.
+security surface where a column you can't forget isn't. RLS (§4) also requires it on the table.
+Drift is prevented by never accepting `TenantId` from the client.
 
 ---
 
@@ -87,16 +87,56 @@ needn't overlap *each other*, so the count overestimates peak concurrency. Count
 slot** makes it exact, since within a slot every covering booking is concurrent throughout. This is
 the main reason time is discretized.
 
-**Chosen mechanism: an amenity-keyed lock** wrapping check-and-insert as one atomic step. A
-thread-safe collection isn't enough — it makes each operation safe while leaving the *sequence*
-interleavable, which is the bug. Keyed per amenity because conflicts never cross amenities. Ordering
-matters: the amenity is validated *before* the gate is created (else random GUIDs grow the dictionary
-unboundedly), and the duplicate-resident check sits *inside* the lock — it's a read-then-write that
-races identically despite reading like validation.
+### Worked example: three residents, one slot
 
-**Two limits, stated plainly.** The lock is per-process, so two API instances and it protects
-nothing. And `lock` can't hold across an `await`, so adding persistence doesn't extend this
-mechanism — it **deletes** it.
+Gym, **capacity 2**. Residents A, B and C all POST `09:00–10:00` at the same instant.
+
+**In the prototype — an amenity-keyed lock makes check-and-insert atomic.**
+
+```
+cheap validation (alignment, past, length)      outside the gate; all three pass
+gate = _amenityGates.GetOrAdd(gymId)            same object for all three
+
+lock(gate)  A   slots 09:00,09:30 hold 0  →  0 < 2  →  INSERT  →  release
+lock(gate)  B   slots 09:00,09:30 hold 1  →  1 < 2  →  INSERT  →  release
+lock(gate)  C   slots 09:00,09:30 hold 2  →  2 ≥ 2  →  409, no write
+
+store: 2 reservations
+```
+
+B and C block at the gate while A holds it, so neither can read a count that a pending write is
+about to invalidate. That is the whole mechanism: **correctness comes from serializing the
+check-and-write**, which is also its limit — it only works while every writer is in one process.
+
+Keyed per amenity, since conflicts never cross amenities. Two ordering details: the amenity is
+validated *before* the gate is created (else random GUIDs grow the dictionary unboundedly), and the
+duplicate-resident check sits *inside* the lock — a read-then-write that races identically, despite
+reading like validation.
+
+**In production — the database refuses the write.** A booking claims the lowest free `seat_index` for
+each slot it covers, one row per slot, in a single transaction:
+
+```
+Same three requests, now spread across three API instances. No shared lock exists.
+
+A  BEGIN  lowest free seat = 0
+          INSERT (gym, 09:00, seat 0), (gym, 09:30, seat 0)   COMMIT   201
+B  BEGIN  lowest free seat = 1
+          INSERT (gym, 09:00, seat 1), (gym, 09:30, seat 1)   COMMIT   201
+C  BEGIN  read was stale — also computed seat 1
+          INSERT (gym, 09:00, seat 1)  →  UNIQUE VIOLATION    ROLLBACK 409
+```
+
+**The difference that matters: C's read being wrong doesn't matter.** Correctness no longer depends
+on reading fresh state, because the *write itself* is what's checked — so it holds across any number
+of instances with no coordination between them. A 90-minute booking inserts three rows in one
+transaction, so it's all-or-nothing; the in-memory version gets that for free only because a
+reservation is a single dictionary entry.
+
+**Two limits of the prototype, stated plainly.** The lock is per-process — two API instances and it
+protects nothing. And `lock` can't hold across an `await`, so adding persistence doesn't *extend*
+this mechanism, it **deletes** it. The lock is scaffolding, not a first step toward the production
+design.
 
 **Rejected alternative: optimistic concurrency with retry.** A version counter, compare-and-swap,
 retry loop and retry budget: strictly more machinery, in exchange for not holding a lock during a
@@ -114,6 +154,9 @@ discussed under the same name.
 | **Redis as atomic slot counters** — one Lua script checks occupancy for every slot and increments, or rejects | **Yes, as the fast path.** Lua executes atomically inside Redis, so there's no lock to lose. All-or-nothing across a multi-slot booking, correct across any number of app instances, and slot TTLs expire the past for free. |
 | **`UNIQUE (amenity_id, slot_start, seat_index)`** in Postgres, `seat_index ∈ 0..capacity-1` | **The actual guarantee**, underneath Redis. The (capacity+1)-th concurrent insert violates the constraint and the transaction aborts. |
 
+In the trace above, Redis would reject C in one round-trip without touching Postgres at all. Note
+what it does *not* change: if Redis were wrong, the constraint still catches C at insert time.
+
 **Why the constraint stays underneath.** Redis replication is asynchronous, so failing over to a
 lagging replica can lose acknowledged writes — and a lost counter *is* an overbooking. Redis buys
 latency, not durability. The dual write is its own hazard: if Redis accepts and the Postgres insert
@@ -129,12 +172,12 @@ portfolio scale, or if bookings become spiky (ticketed events, a pool opening re
 ## 4. Multi-tenancy
 
 The question isn't which entities carry `TenantId` — it's **where the check lives**. Per-handler
-`.Where(x => x.TenantId == ...)` leaks the first time someone forgets one, and nothing in review
-makes that omission visible.
+`.Where(x => x.TenantId == ...)` leaks the first time someone forgets one, and review won't catch
+the omission.
 
 **This slice.** `TenantContext` binds from headers via a `BindAsync` hook returning null when the
 header is absent, so ASP.NET rejects with 400 *before the handler runs*. The store exposes **only
-tenant-scoped accessors** — there is no unscoped `store.Amenities` to reach for, so forgetting the
+tenant-scoped accessors** — no unscoped `store.Amenities` exists to reach for, so forgetting the
 filter isn't a mistake you can make.
 
 **Production, in layers.** *Application* — EF Core global query filters
@@ -175,17 +218,10 @@ endpoint maps it — status codes are a transport concern.
 
 ## 6. Verification
 
-Built test-first; both claims in §3 were **observed failing before being fixed**. The naive capacity
-rule refused the legal `09:30–10:30` booking (`Expected: None, Actual: CapacityExceeded`). Before the
-lock, 8 threads rushing one slot on a capacity-2 amenity *all* succeeded (`Expected: 2, Actual: 8`).
-
-That concurrency test initially **passed** without the lock — the critical section is shorter than
-thread wake-up jitter, so a single rush rarely interleaves. Only repetition (500 trials × 8 racers)
-made it fail reliably; a one-shot version would have read as proof of the most important claim here
-while proving nothing. The endpoint tests went compile-error → green without a behavioural red, so I
-mutation-checked them: breaking the 409 mapping and breaking tenant scoping each failed the right
-test.
+27 tests. Both claims in §3 were **observed failing before being fixed** — the naive capacity rule
+refused the legal `09:30–10:30` booking, and before the lock, 8 threads rushing one slot on a
+capacity-2 amenity *all* succeeded. The concurrency test initially passed without the lock and only
+failed reliably once repeated 500×; details in the PR description.
 
 **Known gap:** `frontend/src/slots.ts` reimplements the occupancy rule to draw the grid and has no
-tests. A drifted client can only mis-*draw*, never overbook, since the server stays authoritative —
-but the failure is silent.
+tests. A drifted client can only mis-*draw*, never overbook — but the failure is silent.
