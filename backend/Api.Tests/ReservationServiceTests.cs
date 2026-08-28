@@ -20,10 +20,13 @@ public class ReservationServiceTests
         return new DateTimeOffset(2026, 9, 1, int.Parse(parts[0]), int.Parse(parts[1]), 0, TimeSpan.Zero);
     }
 
-    private static ReservationService NewService(out TestClock clock)
+    private static ReservationService NewService(out TestClock clock) => NewService(out clock, out _);
+
+    private static ReservationService NewService(out TestClock clock, out InMemoryStore store)
     {
         clock = new TestClock(Morning);
-        return new ReservationService(new InMemoryStore(), clock);
+        store = new InMemoryStore();
+        return new ReservationService(store, clock);
     }
 
     [Fact]
@@ -96,5 +99,131 @@ public class ReservationServiceTests
             Building101, SeedIds.Pool, ResidentA, At("09:00"), At("10:00"));
 
         Assert.Equal(ReservationError.AmenityNotFound, result.Error);
+    }
+
+    [Theory]
+    [InlineData("09:15", "10:15")] // start off the 30-minute grid
+    [InlineData("09:00", "10:20")] // end off the 30-minute grid
+    public void Booking_that_is_not_slot_aligned_is_refused(string start, string end)
+    {
+        var service = NewService(out _);
+
+        var result = service.TryCreateReservation(
+            Building101, SeedIds.Gym, ResidentA, At(start), At(end));
+
+        Assert.Equal(ReservationError.NotSlotAligned, result.Error);
+    }
+
+    [Fact]
+    public void Booking_that_ends_before_it_starts_is_refused()
+    {
+        var service = NewService(out _);
+
+        var result = service.TryCreateReservation(
+            Building101, SeedIds.Gym, ResidentA, At("10:00"), At("09:00"));
+
+        Assert.Equal(ReservationError.InvalidRange, result.Error);
+    }
+
+    [Fact]
+    public void Booking_a_window_that_has_already_started_is_refused()
+    {
+        // Clock is at 08:00; 07:00 is in the past.
+        var service = NewService(out _);
+
+        var result = service.TryCreateReservation(
+            Building101, SeedIds.Gym, ResidentA, At("07:00"), At("08:00"));
+
+        Assert.Equal(ReservationError.StartsInPast, result.Error);
+    }
+
+    [Fact]
+    public void Booking_longer_than_the_amenity_allows_is_refused()
+    {
+        // Gym allows 90 minutes; this asks for 120.
+        var service = NewService(out _);
+
+        var result = service.TryCreateReservation(
+            Building101, SeedIds.Gym, ResidentA, At("09:00"), At("11:00"));
+
+        Assert.Equal(ReservationError.ExceedsMaxBookingLength, result.Error);
+    }
+
+    [Fact]
+    public void A_resident_may_not_hold_two_active_bookings_for_the_same_amenity()
+    {
+        var service = NewService(out _);
+        service.TryCreateReservation(Building101, SeedIds.Gym, ResidentA, At("09:00"), At("10:00"));
+
+        var result = service.TryCreateReservation(
+            Building101, SeedIds.Gym, ResidentA, At("14:00"), At("15:00"));
+
+        Assert.Equal(ReservationError.DuplicateResidentBooking, result.Error);
+    }
+
+    [Fact]
+    public void A_resident_may_book_again_once_their_previous_booking_has_ended()
+    {
+        // Pins the definition of "active": EndUtc > now. See DESIGN.md §2.
+        var service = NewService(out var clock);
+        service.TryCreateReservation(Building101, SeedIds.Gym, ResidentA, At("09:00"), At("10:00"));
+
+        clock.Now = At("10:30");
+
+        var result = service.TryCreateReservation(
+            Building101, SeedIds.Gym, ResidentA, At("11:00"), At("12:00"));
+
+        Assert.Equal(ReservationError.None, result.Error);
+    }
+
+    [Fact]
+    public void A_resident_may_hold_bookings_for_two_different_amenities()
+    {
+        // The limit is per amenity, not global.
+        var service = NewService(out _);
+        service.TryCreateReservation(Building101, SeedIds.Gym, ResidentA, At("09:00"), At("10:00"));
+
+        var result = service.TryCreateReservation(
+            Building101, SeedIds.PartyRoom, ResidentA, At("09:00"), At("10:00"));
+
+        Assert.Equal(ReservationError.None, result.Error);
+    }
+
+    [Fact]
+    public void Concurrent_bookings_of_one_slot_never_exceed_capacity()
+    {
+        // The load-bearing test. Gym capacity is 2; 16 residents rush the same window at once.
+        // Without an atomic check-and-insert, several threads all read "1 < 2" before any of them
+        // writes, and the slot ends up overbooked. See DESIGN.md §3.
+        // The critical section is ~a microsecond, far shorter than thread wake-up jitter, so a
+        // single rush rarely interleaves. Repeating the whole scenario makes the race reproducible
+        // without putting timing hooks in production code.
+        const int Racers = 8;
+        const int Trials = 500;
+
+        for (var trial = 0; trial < Trials; trial++)
+        {
+            var service = NewService(out _, out var store);
+            var errors = new System.Collections.Concurrent.ConcurrentBag<ReservationError>();
+            using var startGate = new ManualResetEventSlim(false);
+
+            var threads = Enumerable.Range(0, Racers)
+                .Select(i => new Thread(() =>
+                {
+                    startGate.Wait();
+                    errors.Add(service.TryCreateReservation(
+                        Building101, SeedIds.Gym, $"resident-{i}", At("09:00"), At("10:00")).Error);
+                }))
+                .ToList();
+
+            foreach (var t in threads) t.Start();
+            startGate.Set(); // release them as close to simultaneously as the scheduler allows
+            foreach (var t in threads) t.Join();
+
+            // The invariant that actually matters: the store never holds more than capacity.
+            Assert.Equal(2, store.ReservationsFor(Building101, SeedIds.Gym).Count);
+            Assert.Equal(2, errors.Count(e => e == ReservationError.None));
+            Assert.Equal(Racers - 2, errors.Count(e => e == ReservationError.CapacityExceeded));
+        }
     }
 }
