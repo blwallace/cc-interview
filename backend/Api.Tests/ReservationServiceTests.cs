@@ -226,4 +226,58 @@ public class ReservationServiceTests
             Assert.Equal(Racers - 2, errors.Count(e => e == ReservationError.CapacityExceeded));
         }
     }
+
+    [Fact]
+    public void A_resident_can_cancel_their_own_booking()
+    {
+        var service = NewService(out _);
+        var booking = service.TryCreateReservation(
+            Building101, SeedIds.Gym, ResidentA, At("09:00"), At("10:00")).Reservation!;
+
+        var error = service.TryCancel(Building101, booking.Id, ResidentA);
+
+        Assert.Equal(CancelError.None, error);
+    }
+
+    [Fact]
+    public void Cancelling_frees_the_slot_for_someone_else()
+    {
+        // Party Room, capacity 1: booked, cancelled, then rebooked by another resident.
+        var service = NewService(out _);
+        var booking = service.TryCreateReservation(
+            Building101, SeedIds.PartyRoom, ResidentA, At("09:00"), At("10:00")).Reservation!;
+        service.TryCancel(Building101, booking.Id, ResidentA);
+
+        var result = service.TryCreateReservation(
+            Building101, SeedIds.PartyRoom, ResidentB, At("09:00"), At("10:00"));
+
+        Assert.Equal(ReservationError.None, result.Error);
+    }
+
+    [Fact]
+    public void A_resident_cannot_cancel_someone_elses_booking()
+    {
+        var service = NewService(out _, out var store);
+        var booking = service.TryCreateReservation(
+            Building101, SeedIds.Gym, ResidentA, At("09:00"), At("10:00")).Reservation!;
+
+        var error = service.TryCancel(Building101, booking.Id, ResidentB);
+
+        Assert.Equal(CancelError.NotOwner, error);
+        Assert.Single(store.ReservationsFor(Building101, SeedIds.Gym));
+    }
+
+    [Fact]
+    public void Cancelling_a_booking_in_another_building_reports_not_found_not_forbidden()
+    {
+        // Existence must not leak across the tenant boundary, so this is NotFound even though the
+        // reservation is real. Ownership is only considered once tenancy checks out (DESIGN.md §5).
+        var service = NewService(out _);
+        var booking = service.TryCreateReservation(
+            Building101, SeedIds.Gym, ResidentA, At("09:00"), At("10:00")).Reservation!;
+
+        var error = service.TryCancel(SeedTenants.Building202, booking.Id, ResidentA);
+
+        Assert.Equal(CancelError.NotFound, error);
+    }
 }

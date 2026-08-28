@@ -19,6 +19,18 @@ public enum ReservationError
 
 public readonly record struct CreateReservationResult(Reservation? Reservation, ReservationError Error);
 
+/// <summary>Why a cancellation was refused.</summary>
+public enum CancelError
+{
+    None = 0,
+
+    /// <summary>No such reservation in the caller's tenant — including one that exists elsewhere.</summary>
+    NotFound,
+
+    /// <summary>Exists and is visible to the caller's building, but belongs to another resident.</summary>
+    NotOwner,
+}
+
 public sealed class ReservationService(InMemoryStore store, TimeProvider clock)
 {
     /// <summary>Bookings are aligned to this grid; capacity is evaluated per slot (DESIGN.md §1, A2).</summary>
@@ -97,5 +109,25 @@ public sealed class ReservationService(InMemoryStore store, TimeProvider clock)
             store.Add(reservation);
             return new CreateReservationResult(reservation, ReservationError.None);
         }
+    }
+
+    public CancelError TryCancel(string tenantId, Guid reservationId, string userId)
+    {
+        // Tenant-scoped lookup, so a reservation in another building is simply not found — the
+        // tenancy check necessarily precedes the ownership check (DESIGN.md §5).
+        var reservation = store.FindReservation(tenantId, reservationId);
+        if (reservation is null) return CancelError.NotFound;
+
+        if (reservation.UserId != userId) return CancelError.NotOwner;
+
+        // Same gate as create, so a removal cannot interleave with a create's occupancy scan and
+        // leave it counting a reservation that is no longer there.
+        var gate = _amenityGates.GetOrAdd(reservation.AmenityId, _ => new object());
+        lock (gate)
+        {
+            store.Remove(reservationId);
+        }
+
+        return CancelError.None;
     }
 }
