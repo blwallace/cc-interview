@@ -4,6 +4,23 @@ A thin, running slice of amenity booking for a multi-tenant property-management 
 Backend is .NET 9 minimal API over an in-memory store; frontend is React + TypeScript talking
 through an orval-generated client.
 
+## What's built vs. designed
+
+Sections below mix working code with designs for things deliberately not built. Which is which:
+
+| Area | State |
+| --- | --- |
+| Per-slot capacity, amenity-keyed lock, validation, cancellation | **Built**, 27 tests (§6) |
+| HTTP endpoints, header-based tenant/user resolution | **Built** |
+| Tenant scoping via store accessors that expose no unscoped collection | **Built** |
+| React UI: availability grid, booking, cancel, building + user switchers | **Built**, driven in a browser |
+| EF Core query filters, Postgres RLS, service-user separation (§4) | **Designed only** — the brief asks for in-memory persistence |
+| `reservation_slots` unique constraint, Redis fast path (§3) | **Designed only** — the production answers |
+| Real authentication | **Not built.** Identity headers are a mock with no security value |
+
+Run it: `cd backend/Api && dotnet run` and `cd frontend && pnpm install && pnpm dev`.
+Tests: `dotnet test backend/Api.Tests`.
+
 ---
 
 ## 1. Assumptions & Trade-offs
@@ -14,7 +31,7 @@ through an orval-generated client.
 | --- | --- | --- |
 | A1 | **Auth is mocked via headers.** `X-Tenant-Id` and `X-User-Id` identify the building and the resident. | No identity provider in the scaffold. See the honesty note below. |
 | A2 | **Time is discretized into 30-minute slots.** Bookings start and end on `:00`/`:30` boundaries. | Makes the capacity check exact rather than conservative (§3). 30 rather than 60 minutes so the seeded gym's `MaxBookingMinutes = 90` stays expressible. |
-| A3 | **All times are UTC**, carried as `DateTimeOffset`. | A booking system that stores naive local times eventually books the wrong hour. Display-time-zone conversion is a UI concern. |
+| A3 | **All times are UTC**, carried as `DateTimeOffset`, and the UI *displays* UTC too. | A booking system that stores naive local times eventually books the wrong hour. Rendering a local grid would misalign the 30-minute boundaries in zones with a `:45` offset, so showing UTC is the honest simplification for a slice — a real build converts for display and states the building's zone. |
 | A4 | **A reservation belongs to exactly one amenity** and cannot span amenities. | Matches the domain. |
 | A5 | **Cancel is a hard delete.** | Keeps cancelled rows from accidentally blocking new bookings. Trade-off below. |
 | A6 | **An amenity belongs to exactly one tenant.** | No amenities shared across buildings in a portfolio. |
@@ -361,8 +378,12 @@ accessors** — handlers never receive the raw collections:
 
 ```csharp
 app.MapGet("/api/amenities", (InMemoryStore store, TenantContext ctx) =>
-    Results.Ok(store.AmenitiesFor(ctx)));
+    Results.Ok(store.AmenitiesFor(ctx.TenantId)));
 ```
+
+`TenantContext` binds via a minimal-API `BindAsync` hook that returns null when `X-Tenant-Id` is
+absent, which makes ASP.NET reject the request with 400 *before the handler runs*. There is no
+ordering for a developer to get wrong.
 
 There is no unscoped `store.Amenities` for a handler to reach for. Forgetting the filter isn't a
 mistake you can make, because the API surface doesn't offer it. That's the property worth having, and
@@ -493,32 +514,90 @@ be reused by a background job, a gRPC surface, or a test without dragging ASP.NE
 
 ## 6. Verification
 
-- **Manual concurrency check.** Fire N simultaneous `POST`s at the same slot on a capacity-2 amenity
-  and assert exactly 2 succeed. This is the only claim in the document that can't be confirmed by
-  reading the code, so it's the one worth exercising.
-- **The over-rejection case from §3** — bookings `09:00–10:00`, `10:00–11:00`, then `09:30–10:30` on
-  a capacity-2 amenity — should **succeed**. It's the regression test for the naive capacity rule.
-- **Tenant isolation** — request `building-202`'s amenity while sending `X-Tenant-Id: building-101`
-  and expect `404`, not `403`. Leaking existence is itself a leak.
-- **Cancellation frees capacity** — book to capacity, cancel one, rebook.
+**27 tests** — 18 against `ReservationService`, 9 against the HTTP surface via
+`WebApplicationFactory`. `dotnet test` and `pnpm build` both run clean.
 
-Automated tests are the first roadmap item; within the time box these were run by hand.
+Everything was built test-first, and the two central claims in §3 were **observed failing before
+being fixed**, rather than argued for and assumed:
+
+### The over-rejection bug, reproduced
+
+The naive capacity rule (count bookings overlapping the request) was implemented deliberately first.
+With the gym at capacity 2 and bookings at `09:00–10:00` and `10:00–11:00`, a request for
+`09:30–10:30` was refused:
+
+```
+Expected: None
+Actual:   CapacityExceeded
+```
+
+Per-slot counting fixes it. `Booking_is_allowed_when_overlapping_bookings_do_not_overlap_each_other`
+is the regression test.
+
+### The race, reproduced
+
+8 threads released simultaneously at one slot on a capacity-2 amenity, before the lock existed:
+
+```
+Expected: 2
+Actual:   8        // all eight bookings landed — 4x overbooked
+```
+
+**A detail worth recording:** the first version of this test *passed* without the lock. The critical
+section is roughly a microsecond — shorter than thread wake-up jitter — so a single rush almost never
+interleaves. Only by repeating the scenario (500 trials × 8 racers) did it fail reliably. A one-shot
+version of this test would have looked like proof of the most important claim in this document while
+proving nothing.
+
+### Test validity was itself checked
+
+The endpoint tests went from compile-error straight to green, so they were never observed failing for
+a behavioural reason. Two deliberate mutations confirmed they bite:
+
+| Mutation | Caught by |
+| --- | --- |
+| Capacity conflict mapped to 400 instead of 409 | `Double_booking_an_exclusive_amenity_returns_409` |
+| Amenities query ignores the caller's tenant | `Amenities_are_scoped_to_the_calling_building` |
+
+### Also covered
+
+Cross-tenant access returns `404` (never `403`) for booking, listing, and cancelling; cancellation
+frees the slot; a resident may hold bookings for two different amenities but not two for one; slot
+alignment, past bookings, inverted ranges, and over-length bookings each reject with their own code.
+
+### Verified by running it
+
+The UI was driven in a browser, not just compiled. That surfaced two defects nothing in the test
+suite would have caught: the reservation list spanned days while displaying only times, and past
+slots rendered as bookable so the rule was only discoverable by being rejected. Both fixed.
 
 ---
 
 ## 7. Next Steps (another 4 hours)
 
-1. **Integration tests, concurrency first.** A `WebApplicationFactory` suite whose headline test
-   fires parallel bookings at one slot and asserts capacity holds. The lock is the load-bearing claim
-   in this design and it is currently backed by argument rather than evidence. Plus the
-   over-rejection and tenant-isolation cases from §6.
-2. **Persistence with the constraint that makes the lock unnecessary.** EF Core + Postgres, the
+1. **Persistence with the constraint that makes the lock unnecessary.** EF Core + Postgres, the
    `reservation_slots` unique index from §3, RLS policies and the connection interceptor from §4.
    This moves the guarantee from per-process to correct-under-horizontal-scaling, and it *retires*
    the lock rather than distributing it — which is also forced, since the critical section becomes
    async and `lock` cannot hold across an `await`. Redis (§3) comes after this, if load justifies it,
    and sits in front of the constraint rather than replacing it.
-3. **Booking rules as data, not conditionals.** Opening hours, cancellation cutoffs, and per-resident
-   quotas are all policy that doesn't exist yet and that will otherwise accrete as `if` statements
-   inside the create path. Moving them behind a small rules abstraction before there are three of
-   them is much cheaper than after.
+2. **Tests for the frontend, starting with the slot math.** `slots.ts` reimplements the server's
+   occupancy rule to render the availability grid, and it has no tests at all — the weakest point in
+   the codebase right now. See the duplication note below: if the two implementations drift, the UI
+   confidently shows wrong availability and nothing fails.
+3. **Swap the header mock for real auth.** `X-Tenant-Id` / `X-User-Id` are the largest fiction here —
+   the entire isolation story is presentational until identity is verified. The shape was chosen so
+   this touches `TenantContext` and little else; doing it early stops code accumulating that assumes
+   identity is free to assert.
+
+Then: booking rules as data (opening hours, cancellation cutoffs, quotas) before they accrete as
+`if` statements in the create path, and local-time display instead of UTC.
+
+### Known duplication
+
+The client recomputes per-slot occupancy from the reservation list in order to draw the grid, using
+the same rule as the server. The server remains authoritative — every booking is re-validated there,
+so a stale or wrong client can only mis-*draw*, never over-book. But the two implementations can
+drift, and the failure is quiet: the grid shows a slot as free that the server will refuse. Worth
+retiring by having the API return computed availability per slot rather than raw reservations, which
+also removes a client-side loop over every booking.
