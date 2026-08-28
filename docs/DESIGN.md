@@ -107,6 +107,7 @@ erDiagram
 ### Key constraints
 
 - `StartUtc` and `EndUtc` align to 30-minute boundaries; `EndUtc > StartUtc`.
+- `StartUtc >= now` — no booking the past.
 - `EndUtc - StartUtc <= Amenity.MaxBookingMinutes`.
 - For every 30-minute slot a reservation covers, the count of reservations covering that slot must
   not exceed `Amenity.Capacity`.
@@ -205,10 +206,11 @@ worth its loss of flexibility.
 ```csharp
 private readonly ConcurrentDictionary<Guid, object> _amenityGates = new();
 
+// Cheap validation runs FIRST — see "Ordering" below.
 var gate = _amenityGates.GetOrAdd(amenityId, _ => new object());
 lock (gate)
 {
-    // read, validate, capacity-check, and insert — one atomic step
+    // duplicate-resident check, capacity check, and insert — one atomic step
 }
 ```
 
@@ -219,17 +221,55 @@ which is exactly the bug.
 
 **Keyed per amenity, not global**, because conflicts only ever exist within one amenity. That's the
 true contention domain, so booking the gym shouldn't serialize behind someone booking guest parking.
+Only one gate is ever held at a time and they are never nested, so deadlock isn't reachable.
 
-Two properties this buys for free:
+### Ordering inside the create path
 
-- **Multi-slot bookings are all-or-nothing.** Holding the lock across the whole check-and-insert
-  means a 3-slot booking takes all three or none; no partial write is observable.
-- **Cancellation takes the same lock**, so a delete can't interleave with a create's scan and produce
-  a stale count.
+```
+1. resolve tenant                                   -> 404 if amenity not in tenant
+2. validate alignment / range / duration / not-past -> 400
+3. take the amenity gate                            <-- only now
+4. duplicate-active-booking check for this resident -> 400
+5. per-slot capacity check                          -> 409
+6. insert
+```
 
-**Limitation, stated plainly: the lock is per-process.** Run two API instances behind a load balancer
-and it protects nothing — each process has its own dictionary. That isn't a flaw in the choice; it's
-the reason the production answer below is a database constraint rather than a bigger lock.
+Two details that are easy to get wrong and both matter:
+
+- **Step 1 must precede step 3.** Creating the gate before validating the amenity lets an
+  unauthenticated caller grow `_amenityGates` without bound by posting random GUIDs. Validate, then
+  take the gate.
+- **Step 4 must be inside the lock.** The duplicate-booking rule is a read-then-write exactly like
+  the capacity check, so it races identically — two simultaneous requests from the same resident
+  would otherwise both pass. It reads like ordinary validation; it isn't.
+
+Cheap checks sit outside the gate to keep the hold short. "Now" comes from an injected
+`TimeProvider`, so the not-in-the-past and active-booking rules are testable without sleeping.
+
+**Cancellation takes the same gate**, so a delete can't interleave with a create's scan and produce a
+stale count.
+
+### What the lock does *not* give us
+
+It would be easy to also credit the lock with making multi-slot bookings all-or-nothing. It doesn't.
+In this model a reservation is a **single dictionary entry** that happens to span several slots, so
+there is no partial state to observe — atomicity there falls out of the data model, not the lock.
+
+That guarantee only becomes load-bearing in the `reservation_slots` design below, where one booking
+is N rows and a transaction is what makes it atomic. Worth stating precisely, because a guarantee
+credited to the wrong mechanism tends to survive into a system where that mechanism is gone.
+
+### Two limitations, stated plainly
+
+- **The lock is per-process.** Run two API instances behind a load balancer and it protects nothing —
+  each process has its own dictionary.
+- **The lock cannot survive going async.** C# forbids `await` inside a `lock` block. The critical
+  section is pure in-memory work today, but the moment persistence lands, every call in it becomes
+  async and the mechanism has to be rewritten or removed.
+
+Neither is a flaw in the choice for this slice. Together they say something specific about the
+roadmap: **the lock is not a step toward the production design, it is what the production design
+deletes.** Adding a database doesn't extend this mechanism — it retires it.
 
 ### Rejected alternative: optimistic concurrency with retry
 
@@ -264,11 +304,47 @@ A booking inserts one row per covered slot, claiming the lowest free `seat_index
 database enforces the invariant across any number of application instances, with no distributed
 coordination.
 
-**A note on Redis/Redlock.** Distributed locks are a poor fit for *correctness* specifically —
-process pauses and clock drift can leave two holders each believing they hold the lock, so the mutual
-exclusion you're relying on isn't guaranteed. Redis is worth adding to *reduce contention* (fail fast
-before touching the database), but it shouldn't be the thing standing between you and an
-overbooking. The unique constraint is simpler, cheaper, and actually sound.
+### Where Redis fits (and where it doesn't)
+
+Redis is the stated long-term destination, so it's worth separating two designs that get discussed
+under the same name and behave very differently.
+
+**Redlock — Redis holding a lock while the data lives in Postgres — is the unsound one.** The lock
+and the data are in different systems. A process that stalls past its lease expiry still holds a
+handle to the database and writes anyway, so the mutual exclusion you're depending on isn't actually
+guaranteed. Adding clock drift makes it worse.
+
+**Redis as the atomic arbiter of the invariant itself is sound**, and it's the design I'd build.
+Redis executes Lua scripts atomically, so the check and the mutation go in one script and there is no
+lock to lose:
+
+```lua
+-- KEYS = one key per 30-minute slot; ARGV = { capacity, reservationId, slotExpiryEpoch }
+for _, k in ipairs(KEYS) do
+  if redis.call('SCARD', k) >= tonumber(ARGV[1]) then return 0 end   -- full, reject
+end
+for _, k in ipairs(KEYS) do
+  redis.call('SADD', k, ARGV[2])
+  redis.call('EXPIREAT', k, ARGV[3])
+end
+return 1
+```
+
+This is the same principle as the unique constraint: put the check and the write in one atomic
+operation *inside the system that owns the data*. It's all-or-nothing across slots, correct across
+any number of application instances, and slot TTLs garbage-collect the past at no cost.
+
+**The caveat that keeps the database underneath it.** Redis replication is asynchronous, so failing
+over to a lagging replica can lose acknowledged writes — and a lost counter is an overbooking. Redis
+is therefore the *fast path*, not the durable guarantee; the unique constraint stays beneath it as
+the backstop. The dual write is its own hazard: if Redis accepts and the Postgres insert then fails,
+capacity leaks until the TTL expires, which needs compensating cleanup.
+
+**When to actually add it.** A single building generates a few hundred bookings a day with
+essentially zero simultaneous contention on one slot — Postgres alone would never feel it. Redis
+earns its place at portfolio scale, or if bookings become spiky (ticketed events, a pool that opens
+reservations at 9am sharp). Right destination; worth having the traffic numbers before taking the
+step, since it buys latency at the cost of a consistency problem that doesn't exist without it.
 
 ---
 
@@ -386,7 +462,8 @@ are injected automatically by the frontend's generated-client mutator.
 
 - **`409 Conflict`** — capacity for at least one covered slot is exhausted.
 - **`400 Bad Request`** — misaligned to a 30-minute boundary, non-positive duration, exceeds
-  `MaxBookingMinutes`, or the resident already holds an active booking for this amenity.
+  `MaxBookingMinutes`, **starts in the past**, or the resident already holds an active booking for
+  this amenity.
 
 Errors return RFC 7807 `ProblemDetails` so the UI can distinguish causes without string-matching.
 
@@ -438,7 +515,9 @@ Automated tests are the first roadmap item; within the time box these were run b
 2. **Persistence with the constraint that makes the lock unnecessary.** EF Core + Postgres, the
    `reservation_slots` unique index from §3, RLS policies and the connection interceptor from §4.
    This moves the guarantee from per-process to correct-under-horizontal-scaling, and it *retires*
-   the lock rather than distributing it.
+   the lock rather than distributing it — which is also forced, since the critical section becomes
+   async and `lock` cannot hold across an `await`. Redis (§3) comes after this, if load justifies it,
+   and sits in front of the constraint rather than replacing it.
 3. **Booking rules as data, not conditionals.** Opening hours, cancellation cutoffs, and per-resident
    quotas are all policy that doesn't exist yet and that will otherwise accrete as `if` statements
    inside the create path. Moving them behind a small rules abstraction before there are three of
