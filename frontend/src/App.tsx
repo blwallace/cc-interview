@@ -1,52 +1,115 @@
-import { useEffect, useState } from 'react';
-import { getAmenities, type Amenity } from './api/generated/api';
+import { useState } from 'react';
+import { useGetAmenities } from './api/generated/api';
+import { AmenityBookingCard } from './AmenityBookingCard';
+import { BUILDINGS, USERS, useIdentity } from './identity';
+import { todayIso } from './slots';
 
-/**
- * Worked example: lists amenities from the backend through the generated client.
- *
- * TODO(candidate): build the reservation experience. Suggested (change it to fit your design):
- *   - pick an amenity and see its existing bookings
- *   - create a booking for a time slot (and surface a clear error on a double-book)
- *   - cancel your own booking
- * After you add backend endpoints, run `pnpm gen:api` to get typed hooks/functions here.
- */
 export function App() {
-  const [amenities, setAmenities] = useState<Amenity[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { tenantId, userId, setTenantId, setUserId } = useIdentity();
+  const [date, setDate] = useState(todayIso);
 
-  useEffect(() => {
-    getAmenities()
-      .then((data) => setAmenities(data))
-      .catch((e) => setError(e instanceof Error ? e.message : 'Failed to load amenities'))
-      .finally(() => setLoading(false));
-  }, []);
+  const { data: amenities = [], isLoading, error } = useGetAmenities();
 
   return (
-    <main style={{ fontFamily: 'system-ui, sans-serif', maxWidth: 640, margin: '2rem auto', padding: '0 1rem' }}>
-      <h1>Amenity Reservations</h1>
-      <p style={{ color: '#555' }}>
-        This is the starter. The amenity list below is the worked example — now build reservations.
-      </p>
+    <div className="shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark">CC</div>
+          <div>
+            <div className="brand-name">Condo Control</div>
+            <div className="brand-sub">Property Management</div>
+          </div>
+        </div>
 
-      {loading && <p>Loading amenities…</p>}
-      {error && (
-        <p style={{ color: '#b00020' }}>
-          Couldn’t reach the API ({error}). Is the backend running on <code>http://localhost:5080</code>?
-        </p>
-      )}
+        <nav className="nav">
+          <button className="nav-item is-active">
+            <span className="nav-icon">▦</span> Amenities
+          </button>
+          {['Dashboard', 'Residents', 'Packages', 'Requests', 'Announcements'].map((item) => (
+            <button key={item} className="nav-item is-muted" disabled>
+              <span className="nav-icon">•</span> {item}
+            </button>
+          ))}
+        </nav>
 
-      <ul style={{ listStyle: 'none', padding: 0 }}>
-        {amenities.map((a) => (
-          <li key={a.id} style={{ border: '1px solid #ddd', borderRadius: 8, padding: '0.75rem 1rem', marginBottom: '0.75rem' }}>
-            <strong>{a.name}</strong>
-            {a.description && <div style={{ color: '#555' }}>{a.description}</div>}
-            <div style={{ fontSize: 13, color: '#777', marginTop: 4 }}>
-              capacity {a.capacity} · max {a.maxBookingMinutes} min
+        <div className="sidebar-foot">
+          Amenity Reservations — take-home slice. Only Amenities is implemented.
+        </div>
+      </aside>
+
+      <main className="main">
+        <header className="topbar">
+          <h1 className="topbar-title">Amenity Reservations</h1>
+          <div className="topbar-spacer" />
+
+          <div className="switcher">
+            <label htmlFor="building">Building</label>
+            <select id="building" value={tenantId} onChange={(e) => setTenantId(e.target.value)}>
+              {BUILDINGS.map((b) => (
+                <option key={b.id} value={b.id}>
+                  {b.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="switcher">
+            <label htmlFor="user">Simulated user</label>
+            <select id="user" value={userId} onChange={(e) => setUserId(e.target.value)}>
+              {USERS.map((u) => (
+                <option key={u.id} value={u.id}>
+                  {u.label} ({u.id})
+                </option>
+              ))}
+            </select>
+          </div>
+        </header>
+
+        <div className="mock-note">
+          Identity is mocked: building and user are sent as <code>X-Tenant-Id</code> /{' '}
+          <code>X-User-Id</code> headers that any caller could set. They demonstrate isolation — they
+          do not enforce it. In production both come from a verified token.
+        </div>
+
+        <div className="content">
+          <div className="page-head">
+            <h2>Book an amenity</h2>
+            <p>
+              Slots are 30 minutes. Pick a start time, then a later slot to extend the booking.
+            </p>
+          </div>
+
+          <div className="row">
+            <div className="field">
+              <label htmlFor="date">Date (UTC)</label>
+              <input
+                id="date"
+                type="date"
+                value={date}
+                min={todayIso()}
+                onChange={(e) => setDate(e.target.value)}
+              />
             </div>
-          </li>
-        ))}
-      </ul>
-    </main>
+          </div>
+
+          {error ? (
+            <div className="banner">
+              Couldn’t reach the API. Is the backend running on <code>http://localhost:5080</code>?
+            </div>
+          ) : null}
+
+          {isLoading && <p className="empty">Loading amenities…</p>}
+
+          {!isLoading &&
+            amenities.map((amenity) => (
+              <AmenityBookingCard key={amenity.id} amenity={amenity} date={date} />
+            ))}
+
+          {!isLoading && !error && amenities.length === 0 && (
+            <p className="empty">No amenities in this building.</p>
+          )}
+        </div>
+      </main>
+    </div>
   );
 }
