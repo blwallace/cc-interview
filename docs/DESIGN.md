@@ -75,23 +75,45 @@ Drift is prevented by never accepting `TenantId` from the client.
 
 ## 3. Preventing double-booking
 
-**The failure mode.** Two residents request the gym for 09:00–10:00 at once. Both read the list, both
-see room, both append. Capacity 2 holds 3. A **TOCTOU race** — check and write aren't atomic, so any
-rule enforced by reading first loses to an interleaving write. Kestrel serves on thread-pool threads,
-so this is reachable, not theoretical.
+Two problems hide under this heading. They are independent, and both have to be solved:
 
-**The check itself has to be right first.** Counting bookings that overlap the request is **wrong
-when capacity > 1**. Gym at capacity 2 with `09:00–10:00` and `10:00–11:00` booked: `09:30–10:30`
-overlaps both, counts 2, refused — yet occupancy never exceeds 2. Bookings overlapping *the request*
-needn't overlap *each other*, so the count overestimates peak concurrency. Counting **per 30-minute
-slot** makes it exact, since within a slot every covering booking is concurrent throughout. This is
-the main reason time is discretized.
+| | Problem | Symptom if unsolved |
+| --- | --- | --- |
+| **A** | **What to count** — is the capacity rule itself correct? | A legal request is wrongly refused, even with no concurrency at all |
+| **B** | **When to count** — are the check and the write atomic? | Concurrent requests each see room and overbook the slot |
 
-### Worked example: three residents, one slot
+A is a logic bug, B is a race. Fixing one does nothing for the other.
 
-Gym, **capacity 2**. Residents A, B and C all POST `09:00–10:00` at the same instant.
+### Problem A — what to count
 
-**In the prototype — an amenity-keyed lock makes check-and-insert atomic.**
+The natural rule is *count the bookings that overlap this request; reject at capacity*. It is **wrong
+whenever capacity > 1**. Gym, capacity 2:
+
+```
+existing    09:00 ──────── 10:00
+existing                   10:00 ──────── 11:00
+requested         09:30 ────────── 10:30       overlaps both → count 2 → REFUSED
+```
+
+But occupancy never exceeds 2 — from 09:30–10:00 the room holds two bookings, from 10:00–10:30 it
+holds two. The request is legal and we refused it. The flaw: bookings overlapping *the request* need
+not overlap *each other*, so a flat count overestimates peak concurrency.
+
+**Fix: count per 30-minute slot, not per request.** Within one slot, every booking covering it is
+concurrent for that slot's whole duration, so the count *is* the peak concurrency and the check
+becomes exact. This is the main reason time is discretized (A2).
+
+### Problem B — when to count: the race
+
+Two residents request the gym for 09:00–10:00 at the same instant. Both read the list, both see room,
+both append. Capacity 2 now holds 3. A **TOCTOU race** — the check and the write are separate steps,
+so any rule enforced by reading first loses to an interleaving write. Kestrel serves on thread-pool
+threads, so this is reachable, not theoretical.
+
+The rest of this section is about B. Below, gym at capacity 2, residents **A, B and C all POST
+`09:00–10:00` simultaneously**.
+
+### Solving B in the prototype: an amenity-keyed lock
 
 ```
 cheap validation (alignment, past, length)      outside the gate; all three pass
@@ -104,17 +126,23 @@ lock(gate)  C   slots 09:00,09:30 hold 2  →  2 ≥ 2  →  409, no write
 store: 2 reservations
 ```
 
-B and C block at the gate while A holds it, so neither can read a count that a pending write is
-about to invalidate. That is the whole mechanism: **correctness comes from serializing the
-check-and-write**, which is also its limit — it only works while every writer is in one process.
+B and C block at the gate while A holds it, so neither can read a count that a pending write is about
+to invalidate. **Correctness comes from serializing check-and-write** — which is also the limit: it
+holds only while every writer is inside one process.
 
-Keyed per amenity, since conflicts never cross amenities. Two ordering details: the amenity is
-validated *before* the gate is created (else random GUIDs grow the dictionary unboundedly), and the
-duplicate-resident check sits *inside* the lock — a read-then-write that races identically, despite
-reading like validation.
+Two details easy to get wrong: the amenity is validated *before* the gate is created (else anyone
+grows the dictionary by posting random GUIDs), and the duplicate-resident check sits *inside* the
+lock — it reads like validation, but it's a read-then-write that races identically.
 
-**In production — the database refuses the write.** A booking claims the lowest free `seat_index` for
-each slot it covers, one row per slot, in a single transaction:
+**Why this doesn't survive contact with production.** The lock is per-process, so two API instances
+and it protects nothing. And `lock` cannot hold across an `await`, so adding a database doesn't
+*extend* this mechanism — it **deletes** it. The lock is scaffolding, not step one.
+
+### Solving B in production: the database refuses the write
+
+Materialize the slots a booking occupies, one row each, with
+`UNIQUE (amenity_id, slot_start, seat_index)` where `seat_index ∈ 0..capacity-1`. A booking claims
+the lowest free seat per slot, in one transaction:
 
 ```
 Same three requests, now spread across three API instances. No shared lock exists.
@@ -127,21 +155,15 @@ C  BEGIN  read was stale — also computed seat 1
           INSERT (gym, 09:00, seat 1)  →  UNIQUE VIOLATION    ROLLBACK 409
 ```
 
-**The difference that matters: C's read being wrong doesn't matter.** Correctness no longer depends
-on reading fresh state, because the *write itself* is what's checked — so it holds across any number
-of instances with no coordination between them. A 90-minute booking inserts three rows in one
-transaction, so it's all-or-nothing; the in-memory version gets that for free only because a
-reservation is a single dictionary entry.
+**The key difference: C's read being wrong doesn't matter.** Correctness no longer depends on reading
+fresh state, because the *write* is what gets checked — so it holds across any number of instances
+with no coordination between them. The transaction also makes a multi-slot booking all-or-nothing.
 
-**Two limits of the prototype, stated plainly.** The lock is per-process — two API instances and it
-protects nothing. And `lock` can't hold across an `await`, so adding persistence doesn't *extend*
-this mechanism, it **deletes** it. The lock is scaffolding, not a first step toward the production
-design.
+### Rejected alternative: optimistic concurrency with retry
 
-**Rejected alternative: optimistic concurrency with retry.** A version counter, compare-and-swap,
-retry loop and retry budget: strictly more machinery, in exchange for not holding a lock during a
-write that appends to a dictionary in nanoseconds. Right tool for low contention across processes;
-wrong trade here.
+A version counter, compare-and-swap, retry loop and retry budget — more machinery, in exchange for
+not holding a lock during a write that appends to a dictionary in nanoseconds. The right tool for low
+contention across process boundaries; here it buys nothing and adds three places for a bug.
 
 ### Redis: considered, not needed here
 
@@ -163,30 +185,39 @@ process stalled past its lease expiry still holds a live database handle and wri
 
 ## 4. Multi-tenancy
 
-The question isn't which entities carry `TenantId` — it's **where the check lives**. Per-handler
-`.Where(x => x.TenantId == ...)` leaks the first time someone forgets one, and review won't catch
-the omission.
+**The rule.** Every amenity and every reservation carries a `TenantId`. Every read and write is
+scoped to the caller's building, and `TenantId` is never accepted from the client — it always comes
+from the resolved request context, so it cannot be spoofed by a request body.
 
-**This slice.** `TenantContext` binds from headers via a `BindAsync` hook returning null when the
-header is absent, so ASP.NET rejects with 400 *before the handler runs*. The store exposes **only
-tenant-scoped accessors** — no unscoped `store.Amenities` exists to reach for, so forgetting the
-filter isn't a mistake you can make.
+**The design question is where that scoping is enforced.** If each handler writes its own
+`.Where(x => x.TenantId == ...)`, isolation holds exactly as long as nobody forgets one — and a
+missing filter looks identical to correct code in review.
 
-**Production, in layers.** *Application* — EF Core global query filters
-(`HasQueryFilter(r => r.TenantId == CurrentTenantId)`); a convenience, not a boundary, since
-`IgnoreQueryFilters()` and raw SQL bypass it. *Infrastructure* — Postgres RLS
-(`CREATE POLICY … USING (tenant_id = current_setting('app.current_tenant_id'))`) with a
-`DbConnectionInterceptor` issuing `SET LOCAL` inside the transaction, so a pooled connection can't
-leak one request's tenant into the next; this holds even if the app is compromised. *Roles* —
-`app_tenant_user` (subject to RLS) for the API, `app_admin_worker` (`BYPASSRLS`) for reporting.
-Cross-tenant reads are a real need; the answer is a role the API never connects as, not a weaker
-policy.
+**In this slice**, two mechanisms, neither of which a handler can opt out of:
 
-**403 vs 404.** Another tenant's resource returns **404** — a 403 confirms existence, and existence
-is tenant-leaking. Within your own building, another resident's booking returns **403**, since the
-reservation list already shows co-residents. Tenancy checks therefore run before ownership checks.
+- `TenantContext` binds from `X-Tenant-Id` via a `BindAsync` hook that returns null when the header
+  is missing, so ASP.NET rejects with `400` *before the handler body runs*.
+- The store exposes **only** scoped accessors — `AmenitiesFor(tenantId)`, `ReservationsFor(tenantId,
+  amenityId)`. There is no unscoped `store.Amenities` to reach for, so forgetting the filter is not a
+  mistake that's available to make.
 
----
+**In production, three layers**, each catching what the one above it misses:
+
+| Layer | Mechanism | Catches | Limit |
+| --- | --- | --- | --- |
+| Application | EF Core global query filters | Developer error; every LINQ query is filtered automatically | `IgnoreQueryFilters()` and raw SQL bypass it |
+| Database | Postgres RLS policy + `SET LOCAL app.current_tenant_id` from a connection interceptor | Everything above it misses — holds against a compromised app or ad-hoc `psql` | Needs `tenant_id` on the table (§2) |
+| Credentials | `app_tenant_user` (subject to RLS) for the API; `app_admin_worker` (`BYPASSRLS`) for reporting | Reporting's real cross-tenant need, without weakening the policy | — |
+
+They aren't redundant: the query filter prevents accidents, RLS *is* the boundary, and the role split
+means the credentials the API holds cannot bypass RLS even if the app is owned. `SET LOCAL` scopes
+the setting to the transaction, so a pooled connection can't leak one request's tenant into the next
+— the easiest detail here to get wrong.
+
+**403 vs 404.** Another building's resource returns **404**, never 403: a 403 confirms the row
+exists, and existence is itself tenant-leaking. Within your own building, another resident's booking
+returns **403**, since the reservation list already shows co-residents. So tenancy is always checked
+before ownership.
 
 ## 5. API surface
 
