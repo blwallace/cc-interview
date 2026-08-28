@@ -6,6 +6,10 @@ namespace Api.Domain;
 public record Amenity
 {
     public required Guid Id { get; init; }
+
+    /// <summary>The owning building. An amenity belongs to exactly one tenant (DESIGN.md §1, A6).</summary>
+    public required string TenantId { get; init; }
+
     public required string Name { get; init; }
     public string? Description { get; init; }
 

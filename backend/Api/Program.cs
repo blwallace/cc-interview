@@ -17,8 +17,9 @@ app.MapGet("/health", () => Results.Ok(new { status = "ok" }))
    .WithName("getHealth")
    .WithTags("System");
 
-// --- Amenities (worked example — read this, then do the same for reservations) ---
-app.MapGet("/api/amenities", (InMemoryStore store) => Results.Ok(store.Amenities))
+// --- Amenities ---
+// TODO: tenant comes from a hardcoded default until the tenant-resolution tests drive it out.
+app.MapGet("/api/amenities", (InMemoryStore store) => Results.Ok(store.AmenitiesFor(SeedTenants.Building101)))
    .WithName("getAmenities")
    .WithTags("Amenities")
    .Produces<IReadOnlyList<Amenity>>();
