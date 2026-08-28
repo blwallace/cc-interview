@@ -1,3 +1,5 @@
+# pnpm 11 blocks dependency postinstall scripts unless listed here.
+# esbuild needs its postinstall to link the platform binary; @scarf/scarf is telemetry, so no.
 allowBuilds:
-  '@scarf/scarf': set this to true or false
-  esbuild: set this to true or false
+  '@scarf/scarf': false
+  esbuild: true
