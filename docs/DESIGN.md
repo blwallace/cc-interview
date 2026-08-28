@@ -143,29 +143,21 @@ retry loop and retry budget: strictly more machinery, in exchange for not holdin
 write that appends to a dictionary in nanoseconds. Right tool for low contention across processes;
 wrong trade here.
 
-### Where Redis fits — and where it doesn't
+### Redis: considered, not needed here
 
-Redis is the intended destination, so it's worth being exact, because two very different designs get
-discussed under the same name.
+**Not for this.** The unique constraint already provides the guarantee, across any number of
+instances, with one datastore to operate. Redis would add a second system, a dual-write hazard
+(accepted in Redis, then the Postgres insert fails — capacity leaks until the TTL expires), and a
+durability gap (async replication can lose acknowledged writes, and a lost counter *is* an
+overbooking, which is why the constraint has to stay underneath regardless). All to buy latency this
+workload doesn't need: one building generates a few hundred bookings a day with essentially no
+simultaneous contention on a single slot.
 
-| Approach | Verdict |
-| --- | --- |
-| **Redlock** — Redis holds a lock while Postgres holds the data | **No.** The lock and the data live in different systems. A process that stalls past its lease expiry still holds a live database handle and writes anyway, so the mutual exclusion you're relying on isn't guaranteed. Clock drift makes it worse. |
-| **Redis as atomic slot counters** — one Lua script checks occupancy for every slot and increments, or rejects | **Yes, as the fast path.** Lua executes atomically inside Redis, so there's no lock to lose. All-or-nothing across a multi-slot booking, correct across any number of app instances, and slot TTLs expire the past for free. |
-| **`UNIQUE (amenity_id, slot_start, seat_index)`** in Postgres, `seat_index ∈ 0..capacity-1` | **The actual guarantee**, underneath Redis. The (capacity+1)-th concurrent insert violates the constraint and the transaction aborts. |
-
-In the trace above, Redis would reject C in one round-trip without touching Postgres at all. Note
-what it does *not* change: if Redis were wrong, the constraint still catches C at insert time.
-
-**Why the constraint stays underneath.** Redis replication is asynchronous, so failing over to a
-lagging replica can lose acknowledged writes — and a lost counter *is* an overbooking. Redis buys
-latency, not durability. The dual write is its own hazard: if Redis accepts and the Postgres insert
-then fails, capacity leaks until the TTL expires and needs compensating cleanup.
-
-**So: add Redis when load justifies it, not before.** One building generates a few hundred bookings a
-day with essentially no simultaneous contention on the same slot — Postgres alone would never notice,
-and Redis would add a consistency problem that doesn't currently exist. It earns its place at
-portfolio scale, or if bookings become spiky (ticketed events, a pool opening reservations at 9am).
+**What would change my mind:** sustained contention on individual slots — a portfolio-wide
+reservation drop (pool bookings opening at 9am), or ticketed events. Then Redis goes *in front* of
+the constraint as a fast rejection path, implemented as an atomic Lua check-and-increment over slot
+counters — never Redlock. A lock held in one system while the data lives in another isn't sound: a
+process stalled past its lease expiry still holds a live database handle and writes anyway.
 
 ---
 
